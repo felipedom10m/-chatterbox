@@ -237,6 +237,7 @@ class T3(nn.Module):
         # HF generate args
         num_return_sequences=1,
         max_new_tokens=None,
+        min_new_tokens=0,
         stop_on_eos=True,
         do_sample=True,
         temperature=0.8,
@@ -275,17 +276,8 @@ class T3(nn.Module):
         # TODO? synchronize the expensive compile function
         # with self.compile_lock:
         if not self.compiled:
-            # Default to None for English models, only create for multilingual
+            # Disable alignment analyzer to prevent forced EOS cutoffs on repetition
             alignment_stream_analyzer = None
-            if self.hp.is_multilingual:
-                alignment_stream_analyzer = AlignmentStreamAnalyzer(
-                    self.tfmr,
-                    None,
-                    text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
-                    alignment_layer_idx=9, # TODO: hparam or something?
-                    eos_idx=self.hp.stop_speech_token,
-                )
-                assert alignment_stream_analyzer.eos_idx == self.hp.stop_speech_token
 
             patched_model = T3HuggingfaceBackend(
                 config=self.cfg,
@@ -385,9 +377,13 @@ class T3(nn.Module):
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
             # Check for EOS token.
-            if next_token.view(-1) == self.hp.stop_speech_token:
-                logger.info(f"✅ EOS token detected! Stopping generation at step {i+1}")
-                break
+            if stop_on_eos and next_token.view(-1) == self.hp.stop_speech_token:
+                if i + 1 < min_new_tokens:
+                    # Ignore early EOS to avoid truncation on longer texts
+                    pass
+                else:
+                    logger.info(f"✅ EOS token detected! Stopping generation at step {i+1}")
+                    break
 
             # Get embedding for the new token.
             next_token_embed = self.speech_emb(next_token)

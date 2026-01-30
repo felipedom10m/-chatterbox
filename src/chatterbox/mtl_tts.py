@@ -131,8 +131,8 @@ class Conditionals:
 
 
 class ChatterboxMultilingualTTS:
-    ENC_COND_LEN = 6 * S3_SR
-    DEC_COND_LEN = 10 * S3GEN_SR
+    ENC_COND_LEN = 30 * S3_SR
+    DEC_COND_LEN = 30 * S3GEN_SR
 
     def __init__(
         self,
@@ -160,10 +160,11 @@ class ChatterboxMultilingualTTS:
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
+        load_map = torch.device("cpu") if str(device) == "cpu" else None
 
         ve = VoiceEncoder()
         ve.load_state_dict(
-            torch.load(ckpt_dir / "ve.pt", weights_only=True)
+            torch.load(ckpt_dir / "ve.pt", map_location=load_map, weights_only=True)
         )
         ve.to(device).eval()
 
@@ -176,7 +177,7 @@ class ChatterboxMultilingualTTS:
 
         s3gen = S3Gen()
         s3gen.load_state_dict(
-            torch.load(ckpt_dir / "s3gen.pt", weights_only=True)
+            torch.load(ckpt_dir / "s3gen.pt", map_location=load_map, weights_only=True)
         )
         s3gen.to(device).eval()
 
@@ -186,7 +187,7 @@ class ChatterboxMultilingualTTS:
 
         conds = None
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
-            conds = Conditionals.load(builtin_voice).to(device)
+            conds = Conditionals.load(builtin_voice, map_location=load_map).to(device)
 
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
@@ -274,11 +275,17 @@ class ChatterboxMultilingualTTS:
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
+        # Prevent early stop on longer texts by allowing more speech tokens
+        text_len = text_tokens.size(1)
+        max_new_tokens = min(self.t3.hp.max_speech_tokens, max(1000, int(text_len * 8)))
+        min_new_tokens = min(max_new_tokens - 1, max(200, int(text_len * 4)))
+
         with torch.inference_mode():
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=1000,  # TODO: use the value in config
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 repetition_penalty=repetition_penalty,
