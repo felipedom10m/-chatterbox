@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 
 import numpy as np
@@ -47,12 +48,35 @@ def main():
     if audio_prompt_path:
         model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
 
-    for job in jobs:
+    total = len(jobs)
+    for idx, job in enumerate(jobs, start=1):
         text = job.get("text", "")
         out_path = job.get("out_path")
+        prefix = job.get("log_prefix", f"[Parte {idx}/{total}]")
         if not out_path:
             print("Job missing out_path.", file=sys.stderr)
             sys.exit(1)
+
+        print(f"{prefix}: iniciou", flush=True)
+
+        class _LogFilter:
+            def __init__(self):
+                self.last_percent = -1
+
+            def write(self, s):
+                match = re.search(r"Sampling:\s+(\d+)%", s)
+                if not match:
+                    return
+                percent = int(match.group(1))
+                if percent % 5 == 0 and percent != self.last_percent:
+                    print(f"{prefix}: {percent}%", flush=True)
+                    self.last_percent = percent
+
+            def flush(self):
+                return
+
+        old_stdout = sys.stdout
+        sys.stdout = _LogFilter()
 
         wav = model.generate(
             text,
@@ -65,6 +89,8 @@ def main():
             top_p=top_p,
             repetition_penalty=repetition_penalty,
         )
+
+        sys.stdout = old_stdout
 
         audio_np = wav.squeeze(0).detach().cpu().numpy()
         _write_wav(out_path, model.sr, audio_np)
