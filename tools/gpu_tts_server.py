@@ -4,6 +4,8 @@ import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 import tempfile
+import time
+import uuid
 
 import numpy as np
 import torch
@@ -27,6 +29,27 @@ def _write_wav_bytes(sr, audio_np):
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = ChatterboxMultilingualTTS.from_pretrained(device)
+voice_sessions = {}
+VOICE_SESSION_TTL_SEC = int(os.environ.get("GPU_TTS_SESSION_TTL_SEC", "7200"))
+VOICE_SESSION_MAX = int(os.environ.get("GPU_TTS_SESSION_MAX", "64"))
+
+
+def _cleanup_voice_sessions():
+    now = time.time()
+    expiradas = [
+        session_id
+        for session_id, info in voice_sessions.items()
+        if now - float(info.get("updated_at", now)) > VOICE_SESSION_TTL_SEC
+    ]
+    for session_id in expiradas:
+        voice_sessions.pop(session_id, None)
+
+    while len(voice_sessions) > VOICE_SESSION_MAX:
+        session_id_mais_antiga = min(
+            voice_sessions.items(),
+            key=lambda item: float(item[1].get("updated_at", now))
+        )[0]
+        voice_sessions.pop(session_id_mais_antiga, None)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -36,22 +59,63 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(payload).encode("utf-8"))
 
-    def do_POST(self):
-        if self.path != "/generate":
-            return self._send_json(404, {"error": "not_found"})
-
+    def _read_payload(self):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            return json.loads(raw.decode("utf-8")), None
         except Exception:
-            return self._send_json(400, {"error": "invalid_json"})
+            return None, {"error": "invalid_json"}
+
+    def _prepare_conditionals_from_b64(self, audio_b64, exaggeration):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(base64.b64decode(audio_b64))
+            tmp_path = tmp.name
+        try:
+            model.prepare_conditionals(tmp_path, exaggeration=exaggeration)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def do_POST(self):
+        _cleanup_voice_sessions()
+
+        payload, erro_payload = self._read_payload()
+        if erro_payload:
+            return self._send_json(400, erro_payload)
+
+        if self.path == "/voice-session":
+            audio_b64 = payload.get("audio_prompt_base64")
+            if not audio_b64:
+                return self._send_json(400, {"error": "missing_audio_prompt"})
+            try:
+                exaggeration = float(payload.get("exaggeration", 0.5))
+                self._prepare_conditionals_from_b64(audio_b64, exaggeration=exaggeration)
+            except Exception as erro:
+                return self._send_json(500, {"error": "voice_session_prepare_failed", "detail": str(erro)})
+
+            voice_session_id = uuid.uuid4().hex
+            voice_sessions[voice_session_id] = {
+                "conds": model.conds,
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            }
+            print(
+                f"[voice-session] criada {voice_session_id[:8]} | "
+                f"ativas={len(voice_sessions)} | ttl={VOICE_SESSION_TTL_SEC}s"
+            )
+            return self._send_json(200, {"voice_session_id": voice_session_id})
+
+        if self.path != "/generate":
+            return self._send_json(404, {"error": "not_found"})
 
         text = payload.get("text", "")
-        audio_b64 = payload.get("audio_prompt_base64")
-        if not text or not audio_b64:
-            return self._send_json(400, {"error": "missing_text_or_audio"})
+        if not text:
+            return self._send_json(400, {"error": "missing_text"})
 
+        voice_session_id = str(payload.get("voice_session_id", "")).strip()
         language_id = payload.get("language_id", "pt")
         exaggeration = float(payload.get("exaggeration", 0.5))
         temperature = float(payload.get("temperature", 0.8))
@@ -60,12 +124,24 @@ class Handler(BaseHTTPRequestHandler):
         top_p = float(payload.get("top_p", 1.0))
         repetition_penalty = float(payload.get("repetition_penalty", 1.2))
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(base64.b64decode(audio_b64))
-            tmp_path = tmp.name
+        if voice_session_id:
+            sessao = voice_sessions.get(voice_session_id)
+            if not sessao:
+                return self._send_json(400, {"error": "invalid_voice_session"})
+            model.conds = sessao["conds"]
+            sessao["updated_at"] = time.time()
+            print(f"[generate] sessão {voice_session_id[:8]} | texto={len(text)} chars")
+        else:
+            audio_b64 = payload.get("audio_prompt_base64")
+            if not audio_b64:
+                return self._send_json(400, {"error": "missing_text_or_audio"})
+            try:
+                self._prepare_conditionals_from_b64(audio_b64, exaggeration=exaggeration)
+            except Exception as erro:
+                return self._send_json(500, {"error": "inline_prepare_failed", "detail": str(erro)})
+            print(f"[generate] modo_inline | texto={len(text)} chars")
 
         try:
-            model.prepare_conditionals(tmp_path, exaggeration=exaggeration)
             wav = model.generate(
                 text,
                 language_id=language_id,
@@ -77,15 +153,16 @@ class Handler(BaseHTTPRequestHandler):
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
             )
+            if voice_session_id and voice_session_id in voice_sessions:
+                voice_sessions[voice_session_id]["conds"] = model.conds
+                voice_sessions[voice_session_id]["updated_at"] = time.time()
+
             audio_np = wav.squeeze(0).detach().cpu().numpy()
             wav_bytes = _write_wav_bytes(model.sr, audio_np)
             audio_out = base64.b64encode(wav_bytes).decode("utf-8")
             return self._send_json(200, {"audio_wav_base64": audio_out})
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+        except Exception as erro:
+            return self._send_json(500, {"error": "generate_failed", "detail": str(erro)})
 
 
 if __name__ == "__main__":
