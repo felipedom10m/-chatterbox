@@ -150,7 +150,14 @@ class ChatterboxMultilingualTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
+        # Some environments (e.g. certain Python/runtime combos) load `perth`
+        # but expose `PerthImplicitWatermarker = None` after an internal import
+        # failure. Fall back to a no-op watermarker so TTS can still run.
+        watermarker_cls = getattr(perth, "PerthImplicitWatermarker", None)
+        if watermarker_cls is None:
+            self.watermarker = perth.DummyWatermarker()
+        else:
+            self.watermarker = watermarker_cls()
 
     @classmethod
     def get_supported_languages(cls):
